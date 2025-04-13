@@ -1,0 +1,5 @@
+*.o
+*.log
+.vscode
+udp_to_tcp
+received_data.txt
