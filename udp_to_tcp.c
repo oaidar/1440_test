@@ -311,6 +311,13 @@ void close_tcp_connection() {
 void log_message(const char* format, ...) {
     if (!log_file) return;
 
+    time_t now = time(NULL);
+    struct tm* timeinfo = localtime(&now);
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+    fprintf(log_file, "[%s] ", timestamp);
+
     va_list args;
     va_start(args, format);
     vfprintf(log_file, format, args);
@@ -323,7 +330,12 @@ void log_message(const char* format, ...) {
 void log_data(const char* direction, const unsigned char* data, int length) {
     if (!log_file) return;
 
-    fprintf(log_file, "%s (%d): ", direction, length);
+    time_t now = time(NULL);
+    struct tm* timeinfo = localtime(&now);
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+    fprintf(log_file, "[%s] %s (%d): ", timestamp, direction, length);
 
     for (int i = 0; i < length; i++) {
         fprintf(log_file, "%02X ", data[i]);
