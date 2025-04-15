@@ -12,28 +12,46 @@
 #include <time.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <pthread.h>
 
 #define MAX_UDP_PACKET_SIZE 120
 #define TCP_RETRY_DELAY 5
-#define POLL_TIMEOUT 1000
+#define QUEUE_SIZE 100
+
+typedef struct {
+    unsigned char data[MAX_UDP_PACKET_SIZE];
+    int length;
+} packet_t;
+
+typedef struct {
+    packet_t packets[QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} packet_queue_t;
 
 int udp_sock = -1;
 int tcp_sock = -1;
+int shutdown_flag = 0;
+int tcp_connection_active = 0;
 FILE* log_file = NULL;
 char prefix[5];
-
-enum {
-    FDS_UDP_SOCK,
-    FDS_TCP_SOCK,
-    MAX_POLL_FDS
-};
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+packet_queue_t queue;
 
 void log_message(const char* format, ...);
 void log_data(const char* direction, const unsigned char* data, int length);
 int setup_udp_socket(const char* ip_port);
 int setup_tcp_socket(const char* ip_port);
-int make_socket_non_blocking(int sock);
 void close_tcp_connection();
+void initialize_queue(packet_queue_t* q);
+int enqueue_packet(packet_queue_t* q, const unsigned char* data, int length);
+int dequeue_packet(packet_queue_t* q, unsigned char* data, int* length);
+void* udp_receiver_thread(void* arg);
+void* tcp_sender_thread(void* arg);
 
 int main(int argc, char* argv[]) {
     if (argc != 5) {
@@ -59,119 +77,243 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    udp_sock = setup_udp_socket(udp_ip_port);
-    if (udp_sock < 0) {
-        log_message("ERROR: Failed to set up UDP socket");
-        fclose(log_file);
-        return 1;
-    }
-
-    struct pollfd fds[MAX_POLL_FDS];
-    int tcp_connection_active = 0;
-    time_t last_tcp_attempt = 0;
+    initialize_queue(&queue);
 
     log_message("INFO: Starting UDP to TCP relay with prefix \"%s\"", prefix);
 
-    while (1) {
-        int nfds = 0;
+    pthread_t udp_thread, tcp_thread;
+    pthread_create(&udp_thread, NULL, udp_receiver_thread, (void*)udp_ip_port);
+    pthread_create(&tcp_thread, NULL, tcp_sender_thread, (void*)tcp_ip_port);
 
-        fds[FDS_UDP_SOCK].fd = udp_sock;
-        fds[FDS_UDP_SOCK].events = POLLIN;
-        fds[FDS_UDP_SOCK].revents = 0;
-        nfds++;
+    pthread_join(udp_thread, NULL);
+    pthread_join(tcp_thread, NULL);
 
-        if (tcp_sock >= 0) {
-            fds[FDS_TCP_SOCK].fd = tcp_sock;
-            fds[FDS_TCP_SOCK].events = POLLIN;
-            fds[FDS_TCP_SOCK].revents = 0;
-            nfds++;
+    if (udp_sock >= 0) close(udp_sock);
+    if (tcp_sock >= 0) close(tcp_sock);
+
+    pthread_mutex_destroy(&queue.mutex);
+    pthread_cond_destroy(&queue.not_empty);
+    pthread_cond_destroy(&queue.not_full);
+    pthread_mutex_destroy(&log_mutex);
+
+    if (log_file) fclose(log_file);
+
+    return 0;
+}
+
+void initialize_queue(packet_queue_t* q) {
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+}
+
+int enqueue_packet(packet_queue_t* q, const unsigned char* data, int length) {
+    pthread_mutex_lock(&q->mutex);
+
+    while (q->count >= QUEUE_SIZE && !shutdown_flag) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    }
+
+    if (shutdown_flag) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+
+    memcpy(q->packets[q->tail].data, data, length);
+    q->packets[q->tail].length = length;
+    q->tail = (q->tail + 1) % QUEUE_SIZE;
+    q->count++;
+
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+int dequeue_packet(packet_queue_t* q, unsigned char* data, int* length) {
+    pthread_mutex_lock(&q->mutex);
+
+    while (q->count <= 0 && !shutdown_flag) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+
+    if (shutdown_flag && q->count <= 0) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+
+    memcpy(data, q->packets[q->head].data, q->packets[q->head].length);
+    *length = q->packets[q->head].length;
+    q->head = (q->head + 1) % QUEUE_SIZE;
+    q->count--;
+
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+void* udp_receiver_thread(void* arg) {
+    const char* udp_ip_port = (const char*)arg;
+
+    udp_sock = setup_udp_socket(udp_ip_port);
+    if (udp_sock < 0) {
+        log_message("ERROR: Failed to set up UDP socket");
+        shutdown_flag = 1;
+        pthread_cond_signal(&queue.not_empty);
+        return NULL;
+    }
+
+    struct sockaddr_storage sender_addr;
+    socklen_t sender_addr_len;
+    unsigned char buffer[MAX_UDP_PACKET_SIZE];
+    int bytes_received;
+
+    while (!shutdown_flag) {
+        sender_addr_len = sizeof(sender_addr);
+        bytes_received = recvfrom(udp_sock, buffer, sizeof(buffer), 0, 
+                                  (struct sockaddr*)&sender_addr, &sender_addr_len);
+
+        if (bytes_received > 0) {
+            log_data("UDP RX", buffer, bytes_received);
+
+            pthread_mutex_lock(&queue.mutex);
+            int should_enqueue = tcp_connection_active;
+            pthread_mutex_unlock(&queue.mutex);
+
+            if (should_enqueue) {
+                if (enqueue_packet(&queue, buffer, bytes_received) < 0) {
+                    break;
+                }
+            } else {
+                log_message("INFO: Discarded UDP packet, TCP connection not active");
+            }
+        } else if (bytes_received < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_message("ERROR: UDP recvfrom() failed: %s", strerror(errno));
+                if (errno != EINTR) {
+                    sleep(1);
+                }
+            }
         }
+    }
 
-        int poll_result = poll(fds, nfds, POLL_TIMEOUT);
+    close(udp_sock);
+    udp_sock = -1;
+    return NULL;
+}
 
-        if (poll_result < 0 && errno != EINTR) {
-            log_message("ERROR: poll() failed: %s", strerror(errno));
-            continue;
-        }
+void* tcp_sender_thread(void* arg) {
+    const char* tcp_ip_port = (const char*)arg;
+    time_t last_tcp_attempt = 0;
+    unsigned char buffer[MAX_UDP_PACKET_SIZE];
+    unsigned char buffer_with_prefix[4 + MAX_UDP_PACKET_SIZE];
+    int bytes_read;
+    struct pollfd pfd;
 
+    memcpy(buffer_with_prefix, prefix, 4);
+
+    while (!shutdown_flag) {
         time_t current_time = time(NULL);
+
         if (tcp_sock < 0 && (current_time - last_tcp_attempt >= TCP_RETRY_DELAY)) {
             tcp_sock = setup_tcp_socket(tcp_ip_port);
             last_tcp_attempt = current_time;
 
-            if (tcp_sock >= 0) {
-                tcp_connection_active = 1;
+            pthread_mutex_lock(&queue.mutex);
+            tcp_connection_active = (tcp_sock >= 0);
+            pthread_mutex_unlock(&queue.mutex);
+
+            if (tcp_connection_active) {
                 log_message("INFO: TCP connection established");
             }
         }
 
-        if (fds[FDS_UDP_SOCK].revents & POLLIN) {
-            struct sockaddr_storage sender_addr;
-            socklen_t sender_addr_len = sizeof(sender_addr);
-            unsigned char buffer[MAX_UDP_PACKET_SIZE];
+        if (tcp_connection_active) {
+            pfd.fd = tcp_sock;
+            pfd.events = POLLIN;
 
-            int bytes_received = recvfrom(udp_sock, buffer, sizeof(buffer), 0, (struct sockaddr*)&sender_addr, &sender_addr_len);
+            if (poll(&pfd, 1, 0) > 0) {
+                if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    log_message("INFO: TCP connection error detected");
+                    close_tcp_connection();
+                    pthread_mutex_lock(&queue.mutex);
+                    tcp_connection_active = 0;
+                    pthread_mutex_unlock(&queue.mutex);
+                    continue;
+                }
 
-            if (bytes_received > 0) {
-                log_data("UDP RX", buffer, bytes_received);
+                if (pfd.revents & POLLIN) {
+                    unsigned char tcp_buffer[1024];
+                    int tcp_bytes_received = recv(tcp_sock, tcp_buffer, sizeof(tcp_buffer), 0);
 
-                if (tcp_connection_active) {
-                    unsigned char buffer_with_prefix[4 + MAX_UDP_PACKET_SIZE];
-                    memcpy(buffer_with_prefix, prefix, 4);
-                    memcpy(buffer_with_prefix + 4, buffer, bytes_received);
+                    if (tcp_bytes_received > 0) {
+                        log_data("TCP RX", tcp_buffer, tcp_bytes_received);
+                        log_message("INFO: Discarded %d bytes from TCP connection", tcp_bytes_received);
+                    } else if (tcp_bytes_received == 0) {
+                        log_message("INFO: TCP connection closed by server");
+                        close_tcp_connection();
+                        pthread_mutex_lock(&queue.mutex);
+                        tcp_connection_active = 0;
+                        pthread_mutex_unlock(&queue.mutex);
+                        continue;
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        log_message("ERROR: TCP recv() failed: %s", strerror(errno));
+                        close_tcp_connection();
+                        pthread_mutex_lock(&queue.mutex);
+                        tcp_connection_active = 0;
+                        pthread_mutex_unlock(&queue.mutex);
+                        continue;
+                    }
+                }
+            }
 
-                    int total_length = bytes_received + 4;
+            pthread_mutex_lock(&queue.mutex);
+            int has_packets = (queue.count > 0);
+            pthread_mutex_unlock(&queue.mutex);
+
+            if (has_packets) {
+                if (dequeue_packet(&queue, buffer, &bytes_read) == 0) {
+                    memcpy(buffer_with_prefix + 4, buffer, bytes_read);
+                    int total_length = bytes_read + 4;
+
                     int bytes_sent = send(tcp_sock, buffer_with_prefix, total_length, 0);
 
                     if (bytes_sent < 0) {
-                        log_message("ERROR: Failed to send data to TCP: %s", strerror(errno));
-                        close_tcp_connection();
-                        tcp_connection_active = 0;
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            log_message("ERROR: Failed to send data to TCP: %s", strerror(errno));
+                            close_tcp_connection();
+                            pthread_mutex_lock(&queue.mutex);
+                            tcp_connection_active = 0;
+                            pthread_mutex_unlock(&queue.mutex);
+                        }
                     } else if (bytes_sent != total_length) {
                         log_message("WARNING: Partial TCP send: %d of %d bytes", bytes_sent, total_length);
                     } else {
                         log_data("TCP TX", buffer_with_prefix, total_length);
                     }
-                } else {
-                    log_message("INFO: Discarded UDP packet, TCP connection not active");
                 }
-            } else if (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                log_message("ERROR: UDP recvfrom() failed: %s", strerror(errno));
+            } else {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += 1;
+
+                pthread_mutex_lock(&queue.mutex);
+                if (queue.count == 0 && !shutdown_flag) {
+                    pthread_cond_timedwait(&queue.not_empty, &queue.mutex, &ts);
+                }
+                pthread_mutex_unlock(&queue.mutex);
             }
-        }
-
-        if (nfds > 1 && (fds[FDS_TCP_SOCK].revents & POLLIN)) {
-            unsigned char buffer[1024];
-            int bytes_received = recv(tcp_sock, buffer, sizeof(buffer), 0);
-
-            if (bytes_received > 0) {
-                log_data("TCP RX", buffer, bytes_received);
-                log_message("INFO: Discarded %d bytes from TCP connection", bytes_received);
-            } else if (bytes_received == 0) {
-                log_message("INFO: TCP connection closed by server");
-                close_tcp_connection();
-                tcp_connection_active = 0;
-            } else if (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                log_message("ERROR: TCP recv() failed: %s", strerror(errno));
-                close_tcp_connection();
-                tcp_connection_active = 0;
-            }
-        }
-
-        if (nfds > 1 && (fds[FDS_TCP_SOCK].revents & (POLLERR | POLLHUP | POLLNVAL))) {
-            log_message("INFO: TCP connection error detected");
-            close_tcp_connection();
-            tcp_connection_active = 0;
+        } else {
+            pfd.fd = -1;
+            pfd.events = 0;
+            poll(&pfd, 1, 100);
         }
     }
 
-    close(udp_sock);
-    if (tcp_sock >= 0) {
-        close(tcp_sock);
-    }
-    fclose(log_file);
-
-    return 0;
+    close_tcp_connection();
+    return NULL;
 }
 
 int setup_udp_socket(const char* ip_port) {
@@ -200,7 +342,16 @@ int setup_udp_socket(const char* ip_port) {
         return -1;
     }
 
-    if (make_socket_non_blocking(sock) < 0) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0) {
+        log_message("ERROR: fcntl(F_GETFL) failed: %s", strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    flags |= O_NONBLOCK;
+    if (fcntl(sock, F_SETFL, flags) < 0) {
+        log_message("ERROR: fcntl(F_SETFL) failed: %s", strerror(errno));
         close(sock);
         return -1;
     }
@@ -252,7 +403,9 @@ int setup_tcp_socket(const char* ip_port) {
         return -1;
     }
 
-    if (make_socket_non_blocking(sock) < 0) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        log_message("ERROR: fcntl() failed: %s", strerror(errno));
         close(sock);
         return -1;
     }
@@ -270,34 +423,17 @@ int setup_tcp_socket(const char* ip_port) {
 
     log_message("INFO: Attempting TCP connection to %s:%d", ip, port);
     if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        if (errno == EINPROGRESS) {
-            log_message("INFO: TCP connection in progress");
-            return sock;
-        } else {
+        if (errno != EINPROGRESS) {
             log_message("ERROR: TCP connect() failed: %s", strerror(errno));
             close(sock);
             return -1;
         }
+        log_message("INFO: TCP connection in progress");
+    } else {
+        log_message("INFO: TCP connection established immediately");
     }
 
-    log_message("INFO: TCP connection established immediately");
     return sock;
-}
-
-int make_socket_non_blocking(int sock) {
-    int flags = fcntl(sock, F_GETFL, 0);
-    if (flags < 0) {
-        log_message("ERROR: fcntl(F_GETFL) failed: %s", strerror(errno));
-        return -1;
-    }
-
-    flags |= O_NONBLOCK;
-    if (fcntl(sock, F_SETFL, flags) < 0) {
-        log_message("ERROR: fcntl(F_SETFL) failed: %s", strerror(errno));
-        return -1;
-    }
-
-    return 0;
 }
 
 void close_tcp_connection() {
@@ -310,6 +446,8 @@ void close_tcp_connection() {
 
 void log_message(const char* format, ...) {
     if (!log_file) return;
+
+    pthread_mutex_lock(&log_mutex);
 
     time_t now = time(NULL);
     struct tm* timeinfo = localtime(&now);
@@ -325,10 +463,14 @@ void log_message(const char* format, ...) {
 
     fprintf(log_file, "\n");
     fflush(log_file);
+
+    pthread_mutex_unlock(&log_mutex);
 }
 
 void log_data(const char* direction, const unsigned char* data, int length) {
     if (!log_file) return;
+
+    pthread_mutex_lock(&log_mutex);
 
     time_t now = time(NULL);
     struct tm* timeinfo = localtime(&now);
@@ -343,4 +485,6 @@ void log_data(const char* direction, const unsigned char* data, int length) {
 
     fprintf(log_file, "\n");
     fflush(log_file);
+
+    pthread_mutex_unlock(&log_mutex);
 }
